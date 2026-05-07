@@ -1,17 +1,33 @@
 """
-PPO Sailing Agent — v3
+PPO Sailing Agent — v4
 ======================
-Changements majeurs vs v2 :
-  1. Correction bug `forced_start` : l'option n'existait pas dans env.reset(),
-     remplacé par `start_position` qui est géré nativement.
-  2. Behavioral Cloning (BC) pré-entraînement : on collecte des trajectoires
-     depuis un expert heuristique, puis on pré-entraîne le réseau par imitation
-     avant de lancer PPO. Si tu as un agent Q-Learning entraîné, tu peux
-     remplacer `heuristic_expert_action` par son policy.
-  3. Curriculum learning corrigé : les phases utilisent `start_position` (géré)
-     et non `forced_start` (inexistant dans env.reset).
-  4. Curiosité intrinsèque légère : bonus pour visiter de nouvelles zones,
-     casse les optima locaux où le bateau reste statique.
+
+Philosophie de cette version
+------------------------------
+Le point de départ est FIXE et CONNU : [64, 0], vitesse nulle.
+C'est aussi la configuration du test. On en tire parti plutôt que de
+l'ignorer avec un curriculum aléatoire qui cause du catastrophic forgetting.
+
+Pipeline :
+  1. BC    — collecte des démos windmaster DEPUIS LE POINT FIXE,
+             pré-entraîne le réseau sur ces trajectoires.
+  2. PPO   — affine depuis ce même point fixe (+ léger bruit de position
+             après convergence initiale, pas de randomisation agressive).
+
+Pourquoi pas de curriculum agressif :
+  - Le point de départ est fixe au test → apprendre depuis des starts
+    aléatoires crée un mismatch train/test.
+  - Phases EASY→MEDIUM→HARD causent du catastrophic forgetting :
+    l'agent oublie la politique EASY quand il voit des starts lointains.
+  - Windmaster résout le problème depuis le point fixe → ses démos
+    couvrent déjà les trajectoires difficiles autour de l'île.
+
+Pourquoi BC sur windmaster fonctionne ici (vs avant) :
+  - On collecte les démos DEPUIS [64,0], pas depuis des starts aléatoires
+    proches du goal → le réseau apprend exactement les transitions du problème réel.
+  - On garde uniquement les épisodes RÉUSSIS de windmaster.
+  - On ajoute un replay buffer des démos BC pendant PPO (DAgger-lite) pour
+    éviter l'oubli catastrophique du comportement expert.
 """
 
 from tqdm import tqdm
@@ -21,55 +37,64 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 import torch.optim as optim
 import numpy as np
+import random
+from collections import deque
 
 from src.env_sailing import SailingEnv
 from src.wind_scenarios import get_wind_scenario
+from src.agents.windmaster import MyAgent
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-NUM_EPISODES      = 2000
-SCENARIOS         = ['training_1', 'training_2', 'training_3']
-SUMMARY_STEP_SIZE = 50
+SCENARIOS   = ['training_1', 'training_2', 'training_3']
+SUMMARY_N   = 50
 
-# Curriculum (seuils en épisodes)
-PHASE_EASY   = NUM_EPISODES // 5          # 0   – 400 : starts proches du goal
-PHASE_MEDIUM = (2 * NUM_EPISODES) // 5    # 400 – 800 : random_start
-PHASE_HARD   = (3 * NUM_EPISODES) // 4    # 800 – 1500 : + random_velocity
-                                           # > 1500 : + wind_start_steps
+# Point de départ fixe (identique à l'environnement de test)
+DEFAULT_START = [64, 0]
 
 # PPO
+NUM_EPISODES    = 2000
 GAMMA           = 0.995
 GAE_LAMBDA      = 0.95
-LR              = 3e-4
+LR              = 5e-5
 UPDATE_TIMESTEP = 4096
-PPO_EPOCHS      = 10
+PPO_EPOCHS      = 3
 MINIBATCH_SIZE  = 256
 CLIP_EPS        = 0.2
 VALUE_CLIP      = 0.2
-ENTROPY_COEF    = 0.03
+ENTROPY_COEF    = 0.001
 VALUE_COEF      = 0.5
 MAX_GRAD_NORM   = 0.5
 CROP_SIZE       = 17
 
 # Reward shaping
-COLLISION_PENALTY = -25.0
-STEP_PENALTY      = -0.02
-DIST_DELTA_REWARD = 0.10
+COLLISION_PENALTY = -10.0
+STEP_PENALTY      = -0.1
+DIST_DELTA_REWARD = 0.50
 HEADING_COEF      = 0.05
 MILESTONE_BONUS   = 2.0
-MILESTONES        = [80, 60, 40, 20, 10]
+MILESTONES        = [100, 80, 60, 40, 20, 10]
 
-# Curiosité intrinsèque
-CURIOSITY_COEF = 0.02    # bonus par nouvelle zone visitée dans l'épisode
-CURIOSITY_RES  = 16      # cases 16×16 → 8×8 zones sur la carte 128×128
+# Curiosité intrinsèque (anti-stagnation)
+CURIOSITY_COEF = 0.001
+CURIOSITY_RES  = 16
 
 # Behavioral Cloning
-BC_EPISODES = 200
-BC_EPOCHS   = 20
-BC_LR       = 1e-3
-BC_BATCH    = 256
+BC_EPISODES     = 300   # épisodes windmaster à collecter
+BC_EPOCHS       = 30
+BC_LR           = 1e-3
+BC_BATCH        = 256
+
+# DAgger-lite : replay des démos BC pendant PPO pour éviter l'oubli
+DEMO_REPLAY_FRAC  = 0.5   # 50% de chaque batch PPO vient des démos BC
+DEMO_BUFFER_SIZE  = 50_000  # transitions BC conservées en mémoire
+
+# Légère perturbation de position après convergence initiale
+# (pas de curriculum agressif — juste un bruit de ±5 cases après ep 500)
+PERTURB_START_EP  = 500
+PERTURB_RADIUS    = 5   # cases
 
 
 # ---------------------------------------------------------------------------
@@ -77,17 +102,21 @@ BC_BATCH    = 256
 # ---------------------------------------------------------------------------
 
 class SailingNet(nn.Module):
+    """
+    CNN pour le crop local + MLP pour les scalaires.
+    Le CNN capture les relations spatiales (obstacle gauche/droite/devant)
+    que le MLP aplati ne peut pas apprendre avec un biais inductif adéquat.
+    """
+
     def __init__(self, crop_size=17, n_actions=9, n_scalars=9):
         super().__init__()
 
-        # CNN spatial : capture les relations voisinage (obstacle gauche/droite)
-        # que le MLP aplati ne peut pas apprendre avec un biais inductif adéquat
         self.map_encoder = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),   # (16, C, C)
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),   # → (16, C, C)
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, padding=0),  # (32, C-2, C-2)
+            nn.Conv2d(16, 32, kernel_size=3, padding=0),  # → (32, C-2, C-2)
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((3, 3)),                  # (32, 3, 3) fixe
+            nn.AdaptiveAvgPool2d((3, 3)),                  # → (32, 3, 3) fixe
             nn.Flatten(),
             nn.Linear(288, 64),
             nn.ReLU(),
@@ -117,7 +146,7 @@ class SailingNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Memory
+# Memory PPO
 # ---------------------------------------------------------------------------
 
 class Memory:
@@ -136,7 +165,7 @@ class Memory:
 
 
 # ---------------------------------------------------------------------------
-# Agent
+# Agent PPO
 # ---------------------------------------------------------------------------
 
 class PPOSailingAgent:
@@ -149,6 +178,13 @@ class PPOSailingAgent:
             self.optimizer, start_factor=1.0, end_factor=0.1, total_iters=NUM_EPISODES)
         self.policy_old = SailingNet(crop_size=crop_size)
         self.policy_old.load_state_dict(self.policy.state_dict())
+
+        # Buffer de démos BC pour DAgger-lite (évite catastrophic forgetting)
+        self.demo_buffer = deque(maxlen=DEMO_BUFFER_SIZE)
+
+    # ------------------------------------------------------------------
+    # Extraction features
+    # ------------------------------------------------------------------
 
     def get_local_crop(self, obs):
         pos    = obs[0:2].astype(int)
@@ -175,7 +211,7 @@ class PPOSailingAgent:
         atg    = np.arctan2(dy, dx)
         s = torch.FloatTensor([
             obs[2]/10.0, obs[3]/10.0,
-            dx/128.0, dy/128.0,
+            dx/128.0,    dy/128.0,
             da/np.pi,
             obs[0]/128.0, obs[1]/128.0,
             np.sin(atg),
@@ -183,24 +219,36 @@ class PPOSailingAgent:
         ]).unsqueeze(0)
         return s, curr_a, atg
 
+    # ------------------------------------------------------------------
+    # Action
+    # ------------------------------------------------------------------
+
     def select_action(self, obs, goal, prev_angle):
         with torch.no_grad():
-            m_in       = self.get_local_crop(obs)
-            s_in, curr_a, atg = self.build_scalars(obs, goal, prev_angle)
-            logits, v  = self.policy_old(m_in, s_in)
-            dist       = Categorical(logits=logits)
-            action     = dist.sample()
-        return action.item(), dist.log_prob(action), v.squeeze(), curr_a, atg, m_in, s_in
+            m_in          = self.get_local_crop(obs)
+            s_in, ca, atg = self.build_scalars(obs, goal, prev_angle)
+            logits, v     = self.policy_old(m_in, s_in)
+            dist          = Categorical(logits=logits)
+            action        = dist.sample()
+        return action.item(), dist.log_prob(action), v.squeeze(), ca, atg, m_in, s_in
 
-    def compute_gae(self, rewards, dones, values, next_value):
+    # ------------------------------------------------------------------
+    # GAE
+    # ------------------------------------------------------------------
+
+    def compute_gae(self, rewards, dones, values, next_val=0):
         adv, gae = [], 0
-        vals = values + [next_value]
+        vals = values + [next_val]
         for t in reversed(range(len(rewards))):
             delta = rewards[t] + GAMMA * vals[t+1] * (1 - dones[t]) - vals[t]
             gae   = delta + GAMMA * GAE_LAMBDA * (1 - dones[t]) * gae
             adv.insert(0, gae)
         ret = [a + v for a, v in zip(adv, vals[:-1])]
         return adv, ret
+
+    # ------------------------------------------------------------------
+    # PPO update avec DAgger-lite
+    # ------------------------------------------------------------------
 
     def update(self, memory):
         with torch.no_grad():
@@ -209,7 +257,7 @@ class PPOSailingAgent:
             acts  = torch.tensor(memory.actions)
             olp   = torch.stack(memory.logprobs)
             adv, ret = self.compute_gae(
-                memory.rewards, memory.is_terminals, memory.values, 0)
+                memory.rewards, memory.is_terminals, memory.values)
             adv = torch.tensor(adv, dtype=torch.float32)
             ret = torch.tensor(ret, dtype=torch.float32)
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -217,8 +265,11 @@ class PPOSailingAgent:
         N = len(acts)
         for _ in range(PPO_EPOCHS):
             idx = np.random.permutation(N)
+
             for s in range(0, N, MINIBATCH_SIZE):
                 mb = idx[s:s+MINIBATCH_SIZE]
+
+                # --- PPO classique ---
                 logits, vals = self.policy(map_s[mb], sca_s[mb])
                 dist    = Categorical(logits=logits)
                 nlp     = dist.log_prob(acts[mb])
@@ -234,7 +285,20 @@ class PPOSailingAgent:
                 vc     = mb_ret + (v - mb_ret).clamp(-VALUE_CLIP, VALUE_CLIP)
                 closs  = 0.5 * torch.max(
                     (v - mb_ret).pow(2), (vc - mb_ret).pow(2)).mean()
-                loss = aloss + VALUE_COEF * closs - ENTROPY_COEF * entropy
+
+                # --- DAgger-lite : régularisation BC sur les démos expert ---
+                # Empêche d'oublier les comportements windmaster pendant PPO.
+                bc_loss = torch.tensor(0.0)
+                if len(self.demo_buffer) > BC_BATCH:
+                    n_demo = max(1, int(len(mb) * DEMO_REPLAY_FRAC))
+                    demo_batch = random.sample(self.demo_buffer, n_demo)
+                    d_maps    = torch.cat([d[0] for d in demo_batch])
+                    d_scalars = torch.cat([d[1] for d in demo_batch])
+                    d_acts    = torch.tensor([d[2] for d in demo_batch])
+                    d_logits, _ = self.policy(d_maps, d_scalars)
+                    bc_loss = F.cross_entropy(d_logits, d_acts)
+
+                loss = aloss + VALUE_COEF * closs - ENTROPY_COEF * entropy + 1 * bc_loss
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), MAX_GRAD_NORM)
@@ -243,43 +307,51 @@ class PPOSailingAgent:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
     # ------------------------------------------------------------------
-    # Behavioral Cloning
+    # Behavioral Cloning (phase initiale)
     # ------------------------------------------------------------------
 
     def behavioral_cloning(self, demos):
         """
-        Pré-entraîne le réseau par imitation sur des trajectoires d'expert.
-        demos : liste de (map_tensor 1×3×C×C, scalar_tensor 1×9, action_int)
-
-        Pour utiliser ton propre agent Q-Learning à la place de l'heuristique,
-        remplace `heuristic_expert_action` dans `collect_expert_demos` par
-        ton policy Q-Learning : action = q_agent.act(obs)
+        Pré-entraîne le réseau sur les démos windmaster par cross-entropy.
+        Stocke aussi les démos dans le buffer DAgger pour l'entraînement PPO.
         """
         print(f"\n=== Behavioral Cloning — {len(demos)} transitions ===")
         opt = optim.Adam(self.policy.parameters(), lr=BC_LR)
+
+        # Stocker dans le replay buffer DAgger
+        self.demo_buffer.extend(demos)
 
         maps    = torch.cat([d[0] for d in demos])
         scalars = torch.cat([d[1] for d in demos])
         actions = torch.tensor([d[2] for d in demos])
 
         N = len(actions)
+        best_loss = float('inf')
         for epoch in range(BC_EPOCHS):
-            idx        = np.random.permutation(N)
+            idx = np.random.permutation(N)
             total_loss = 0.0
             for s in range(0, N, BC_BATCH):
-                mb      = idx[s:s+BC_BATCH]
+                mb = idx[s:s+BC_BATCH]
                 logits, _ = self.policy(maps[mb], scalars[mb])
-                loss    = F.cross_entropy(logits, actions[mb])
+                loss = F.cross_entropy(logits, actions[mb])
                 opt.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), MAX_GRAD_NORM)
                 opt.step()
                 total_loss += loss.item() * len(mb)
+            avg = total_loss / N
             if (epoch + 1) % 5 == 0:
-                print(f"  Epoch {epoch+1:3d}/{BC_EPOCHS} | Loss: {total_loss/N:.4f}")
+                print(f"  Epoch {epoch+1:3d}/{BC_EPOCHS} | Loss: {avg:.4f}")
+            if avg < best_loss:
+                best_loss = avg
+                # Sauvegarde du meilleur état BC
+                self._best_bc_state = {k: v.clone() for k, v in self.policy.state_dict().items()}
 
+        # Charge le meilleur état plutôt que le dernier
+        if hasattr(self, '_best_bc_state'):
+            self.policy.load_state_dict(self._best_bc_state)
         self.policy_old.load_state_dict(self.policy.state_dict())
-        print("=== BC terminé ===\n")
+        print(f"  Meilleure loss BC : {best_loss:.4f}\n=== BC terminé ===\n")
 
     def save(self, path):
         torch.save(self.policy.state_dict(), path)
@@ -288,79 +360,72 @@ class PPOSailingAgent:
 
 
 # ---------------------------------------------------------------------------
-# Expert heuristique
+# Collecte des démos windmaster
 # ---------------------------------------------------------------------------
 
-def heuristic_expert_action(obs, goal, world_map):
+def collect_windmaster_demos(agent, n_episodes=BC_EPISODES):
     """
-    Expert simple : se dirige vers le goal en évitant les murs immédiats.
-    Utilisé pour la collecte de démos BC.
+    Roule windmaster DEPUIS LE POINT DE DÉPART FIXE [64, 0].
+    Ne conserve que les épisodes réussis.
 
-    REMPLACER PAR TON Q-LEARNING si disponible :
-        action = q_agent.act(obs)   # ton agent entraîné
+    Pourquoi le point fixe uniquement :
+      - C'est la config du test → les démos couvrent exactement le problème réel.
+      - Windmaster réussit souvent depuis ce point → démos de qualité.
+      - Pas de mismatch entre les démos et les épisodes PPO.
     """
-    pos = obs[0:2].astype(int)
-    directions = [
-        (0, 1), (1, 1), (1, 0), (1, -1),
-        (0, -1), (-1, -1), (-1, 0), (-1, 1)
-    ]
-    best_a, best_d = 8, float('inf')
-    for i, (dx, dy) in enumerate(directions):
-        nx = int(np.clip(pos[0] + dx, 0, 127))
-        ny = int(np.clip(pos[1] + dy, 0, 127))
-        if world_map[ny, nx] == 1:
-            continue
-        d = np.linalg.norm(np.array([nx, ny]) - goal)
-        if d < best_d:
-            best_d, best_a = d, i
-    return best_a
+    if MyAgent is None:
+        print("AVERTISSEMENT: windmaster non trouvé, BC ignoré.")
+        return []
 
+    expert   = MyAgent()
+    demos    = []
+    success  = 0
+    failed   = 0
 
-def collect_expert_demos(agent, n_episodes=BC_EPISODES):
-    """
-    Collecte des trajectoires d'expert (succès uniquement) pour le BC.
-    Lance des épisodes avec starts proches du goal pour maximiser
-    le taux de succès de l'heuristique simple.
-    """
-    demos, success = [], 0
-    print(f"\n=== Collecte démos expert ({n_episodes} épisodes) ===")
+    print(f"\n=== Collecte démos windmaster ({n_episodes} épisodes depuis {DEFAULT_START}) ===")
 
     for ep in tqdm(range(n_episodes)):
         scenario = SCENARIOS[ep % 3]
         env      = SailingEnv(**get_wind_scenario(scenario))
+
+        # Toujours depuis le point de départ fixe, vitesse nulle
+        obs, info = env.reset(options={"start_position": DEFAULT_START})
+        expert.reset()
         goal     = env.goal_position
-        wmap     = env._create_world()
 
-        # Start proche du goal (l'heuristique glouton réussit souvent sur <30 cases)
-        start_opts = {}
-        for _ in range(30):
-            a  = np.random.uniform(0, 2 * np.pi)
-            r  = np.random.uniform(5, 30)
-            sx = int(np.clip(goal[0] + r * np.cos(a), 1, 126))
-            sy = int(np.clip(goal[1] + r * np.sin(a), 1, 126))
-            if wmap[sy, sx] == 0:
-                start_opts = {"start_position": [sx, sy]}
-                break
-
-        obs, info = env.reset(options=start_opts)
-        goal      = env.goal_position
-        prev_a    = None
         ep_demos  = []
+        prev_a    = None
+        ep_success = False
 
         for _ in range(500):
-            act      = heuristic_expert_action(obs, goal, wmap)
-            m_in     = agent.get_local_crop(obs)
+            # Action windmaster
+            act  = expert.act(obs)
+
+            # Features pour notre réseau
+            m_in          = agent.get_local_crop(obs)
             s_in, prev_a, _ = agent.build_scalars(obs, goal, prev_a)
             ep_demos.append((m_in, s_in, act))
 
             obs, r, done, trunc, info = env.step(act)
             if done or trunc:
                 if r > 0:
-                    demos.extend(ep_demos)
-                    success += 1
+                    ep_success = True
                 break
 
-    print(f"  {len(demos)} transitions collectées ({success}/{n_episodes} succès)")
+        if ep_success:
+            demos.extend(ep_demos)
+            success += 1
+        else:
+            failed += 1
+
+    print(f"  Succès : {success}/{n_episodes} | "
+          f"Transitions conservées : {len(demos)} | "
+          f"Taux : {success/n_episodes*100:.1f}%")
+
+    if success == 0:
+        print("  AVERTISSEMENT: windmaster n'a pas réussi depuis [64,0]. "
+              "Vérifier la configuration de l'environnement.")
+
     return demos
 
 
@@ -369,7 +434,7 @@ def collect_expert_demos(agent, n_episodes=BC_EPISODES):
 # ---------------------------------------------------------------------------
 
 class CuriosityTracker:
-    """Bonus pour la première visite d'une zone 16×16 dans l'épisode."""
+    """Bonus pour première visite d'une zone 16×16 dans l'épisode."""
     def __init__(self, resolution=CURIOSITY_RES):
         self.res     = resolution
         self.visited = set()
@@ -386,39 +451,34 @@ class CuriosityTracker:
 
 
 # ---------------------------------------------------------------------------
-# Curriculum
+# Options de reset
 # ---------------------------------------------------------------------------
 
-def curriculum_options(ep, goal, world_map):
+def get_reset_options(ep, world_map):
     """
-    Options de reset selon la phase.
-    Utilise 'start_position' (géré par env.reset) et non 'forced_start'.
+    Pas de curriculum agressif.
+
+    Épisodes 0 – PERTURB_START_EP : toujours le point fixe [64, 0].
+    Épisodes > PERTURB_START_EP   : point fixe + bruit ±PERTURB_RADIUS cases.
+
+    Pourquoi pas de random_start :
+      - Le test utilise toujours [64, 0].
+      - random_start crée un mismatch train/test et du catastrophic forgetting.
+      - windmaster réussit depuis [64, 0] → on veut que PPO apprenne depuis là.
     """
-    options = {}
+    if ep < PERTURB_START_EP:
+        return {"start_position": DEFAULT_START}
 
-    if ep < PHASE_EASY:
-        for _ in range(50):
-            a  = np.random.uniform(0, 2 * np.pi)
-            r  = np.random.uniform(8, 28)
-            sx = int(np.clip(goal[0] + r * np.cos(a), 1, 126))
-            sy = int(np.clip(goal[1] + r * np.sin(a), 1, 126))
-            if world_map[sy, sx] == 0:
-                options["start_position"] = [sx, sy]
-                break
+    # Légère perturbation après convergence initiale
+    for _ in range(20):
+        noise_x = int(np.random.randint(-PERTURB_RADIUS, PERTURB_RADIUS + 1))
+        noise_y = int(np.random.randint(-PERTURB_RADIUS, PERTURB_RADIUS + 1))
+        sx = int(np.clip(DEFAULT_START[0] + noise_x, 1, 126))
+        sy = int(np.clip(DEFAULT_START[1] + noise_y, 1, 126))
+        if world_map[sy, sx] == 0:
+            return {"start_position": [sx, sy]}
 
-    elif ep < PHASE_MEDIUM:
-        options["random_start"] = True
-
-    elif ep < PHASE_HARD:
-        options["random_start"]     = True
-        options["wind_start_steps"] = int(np.random.randint(0, 100))
-
-    else:
-        options["random_start"]    = True
-        options["random_velocity"] = True
-        options["wind_start_steps"] = int(np.random.randint(0, 100))
-
-    return options
+    return {"start_position": DEFAULT_START}
 
 
 # ---------------------------------------------------------------------------
@@ -429,13 +489,28 @@ agent     = PPOSailingAgent(CROP_SIZE)
 memory    = Memory()
 curiosity = CuriosityTracker()
 
-# Phase 0 : Behavioral Cloning
-demos = collect_expert_demos(agent, BC_EPISODES)
+# --- Phase 1 : Behavioral Cloning depuis windmaster ---
+demos = collect_windmaster_demos(agent, BC_EPISODES)
 if demos:
-    print("\n=== Pré-entraînement BC ===")
     agent.behavioral_cloning(demos)
+    # Évaluation rapide post-BC
+    print("=== Évaluation post-BC (10 épisodes depuis [64,0]) ===")
+    bc_successes = 0
+    for ep in range(10):
+        env_eval = SailingEnv(**get_wind_scenario(SCENARIOS[ep % 3]))
+        obs_e, _ = env_eval.reset(options={"start_position": DEFAULT_START})
+        goal_e   = env_eval.goal_position
+        pa_e     = None
+        for _ in range(500):
+            act_e, _, _, pa_e, _, _, _ = agent.select_action(obs_e, goal_e, pa_e)
+            obs_e, r_e, done_e, trunc_e, _ = env_eval.step(act_e)
+            if done_e or trunc_e:
+                if r_e > 0: bc_successes += 1
+                break
+    print(f"  Succès post-BC : {bc_successes}/10\n")
 del demos
 
+# --- Phase 2 : PPO depuis le point fixe ---
 history        = {s: {'rewards': [], 'collision': [], 'success': [],
                        'steps': [], 'shaped_rewards': []} for s in SCENARIOS}
 scenario_stats = {s: {'rewards': [], 'collision': [], 'success': [],
@@ -448,7 +523,7 @@ for ep in tqdm(range(NUM_EPISODES)):
     goal     = env.goal_position
     wmap     = env._create_world()
 
-    obs, info = env.reset(options=curriculum_options(ep, goal, wmap))
+    obs, info = env.reset(options=get_reset_options(ep, wmap))
     goal      = env.goal_position
 
     curiosity.reset()
@@ -458,13 +533,13 @@ for ep in tqdm(range(NUM_EPISODES)):
     ep_steps  = 0
     collision = False
     milestones = set()
+    shaped_r  = 0.0
 
     for t in range(500):
         total_step += 1
         ep_steps   += 1
 
-        act, lp, value, p_angle, atg, m_in, s_in = agent.select_action(
-            obs, goal, p_angle)
+        act, lp, value, p_angle, atg, m_in, s_in = agent.select_action(obs, goal, p_angle)
         next_obs, r, done, trunc, info = env.step(act)
 
         curr_dist = np.linalg.norm(info['position'] - goal)
@@ -474,6 +549,7 @@ for ep in tqdm(range(NUM_EPISODES)):
         dist_delta = np.clip(p_dist - curr_dist, -1.0, 1.0)
         shaped_r   = r + dist_delta * DIST_DELTA_REWARD + STEP_PENALTY
 
+        # Cap vers le goal
         vel   = next_obs[2:4]
         speed = np.linalg.norm(vel)
         if speed > 0.5:
@@ -481,13 +557,16 @@ for ep in tqdm(range(NUM_EPISODES)):
             err      = abs(np.arctan2(np.sin(atg - vel_a), np.cos(atg - vel_a)))
             shaped_r += HEADING_COEF * np.cos(err)
 
+        # Milestones de distance
         for radius in MILESTONES:
             if curr_dist < radius and radius not in milestones:
                 shaped_r += MILESTONE_BONUS
                 milestones.add(radius)
 
+        # Curiosité
         shaped_r += curiosity.bonus(info['position'])
 
+        # Collision
         if collision:
             shaped_r += COLLISION_PENALTY
             done       = True
@@ -521,12 +600,10 @@ for ep in tqdm(range(NUM_EPISODES)):
         store[scenario]['success'].append(1 if success else 0)
         store[scenario]['steps'].append(ep_steps if not collision else None)
 
-    if (ep + 1) % SUMMARY_STEP_SIZE == 0:
+    if (ep + 1) % SUMMARY_N == 0:
         lr    = agent.optimizer.param_groups[0]['lr']
-        phase = ("EASY"   if ep < PHASE_EASY   else
-                 "MEDIUM" if ep < PHASE_MEDIUM else
-                 "HARD"   if ep < PHASE_HARD   else "FULL")
-        print(f"\n--- Ep {ep+1} | LR: {lr:.2e} | Phase: {phase} ---")
+        perturb = "PERTURB" if ep >= PERTURB_START_EP else "FIXED"
+        print(f"\n--- Ep {ep+1}/{NUM_EPISODES} | LR: {lr:.2e} | Start: {perturb} ---")
         for s in SCENARIOS:
             d   = scenario_stats[s]
             sr  = np.mean(d['success'])   * 100
@@ -547,5 +624,6 @@ if memory.rewards:
     agent.update(memory)
     memory.clear()
 
-agent.save("mlp_model.pth")
-np.savez("history.npz", **history)
+agent.save("no_curriculum_mlp_model.pth")
+np.savez("no_curriculum_history.npz", **history)
+print("\nEntraînement terminé. Modèle sauvegardé : no_curriculum_mlp_model.pth")

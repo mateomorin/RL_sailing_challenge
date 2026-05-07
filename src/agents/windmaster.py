@@ -5,7 +5,10 @@ import os
 try:
     from base_agent import BaseAgent
 except ImportError:
-    from agents.base_agent import BaseAgent
+    try:
+        from agents.base_agent import BaseAgent
+    except ImportError:
+        from src.agents.base_agent import BaseAgent
 
 # from evaluator.base_agent import BaseAgent
 
