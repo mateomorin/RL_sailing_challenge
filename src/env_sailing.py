@@ -143,19 +143,21 @@ class SailingEnv(gym.Env): # type: ignore
         self.world_map = self._create_world()
         self.island_layer = build_island_layer(self.world_map)
 
-        # 2. Gestion de la Position (On reste en INT pour éviter l'IndexError plus tard)
+        # 2. Gestion de la Position
         if options and "start_position" in options:
             self.position = np.array(options["start_position"], dtype=int)
         elif options and options.get("random_start", False):
             valid_spawn = False
             while not valid_spawn:
-                rx = np.random.randint(5, self.grid_size[0] - 5)
-                ry = np.random.randint(5, self.grid_size[1] - 5)
+                rx = np.random.randint(0, self.grid_size[0])
+                ry = np.random.randint(0, self.grid_size[1])
+                
+                # Vérification sur la world_map (0 = eau, 1 = terre/île)
                 if self.world_map[ry, rx] == 0:
-                    self.position = np.array([rx, ry], dtype=int) # Forçage en int
+                    self.position = np.array([rx, ry], dtype=int)
                     valid_spawn = True
         else:
-            # Position par défaut (Comportement initial exact)
+            # Position par défaut : centre horizontal, tout en bas (y=0)
             self.position = np.array([self.grid_size[0] // 2, 0], dtype=int)
 
         # 3. Gestion de la Vitesse

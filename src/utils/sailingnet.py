@@ -12,51 +12,75 @@ from src.env_sailing import SailingEnv
 from src.wind_scenarios import get_wind_scenario
 
 # --- Configuration ---
-NUM_EPISODES = 1000
-GAMMA = 0.995
-LR = 1e-4
-UPDATE_TIMESTEP = 2000 
-SCENARIOS = ['training_1', 'training_2', 'training_3']
-CROP_SIZE = 32
 
-# --- Configuration du Curriculum ---
-# On commence à introduire l'aléa après 1/3 de l'entraînement
-RANDOM_START_EP = NUM_EPISODES // 3  
-# On introduit la vitesse initiale après 2/3
-RANDOM_VELO_EP = (2 * NUM_EPISODES) // 3 
+# Episodes
+NUM_EPISODES = 5000
+RANDOM_START_EP = NUM_EPISODES // 2  
+RANDOM_VELO_EP = (3 * NUM_EPISODES) // 4
+SCENARIOS = ['training_1', 'training_2', 'training_3']
+
+# Modèle
+GAMMA = 0.995
+UPDATE_TIMESTEP = 2000 
+LR = 2e-4
+CROP_SIZE = 21
+
+# Reward Shaping
+COLLISION_PENALTY = -1
+SPEED_REWARD_THRESHOLD = 4
+SPEED_REWARD = 0
+BORDER_PENALTY_THRESHOLD = 5
+BORDER_PENALTY = -0.01
+PROGRESS_REWARD_SCALE = 1
+
+# Bilan
+SUMMARY_STEP_SIZE = 50
 
 class SailingNet(nn.Module):
-    """Architecture hybride CNN + MLP pour le traitement des cartes et vecteurs."""
-    def __init__(self, crop_size=32, n_actions=9):
+    """Architecture MLP pure : traite le voisinage local comme un capteur de proximité."""
+    def __init__(self, crop_size=7, n_actions=9):
         super().__init__()
-        # Branche spatiale (Local Crop)
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU(),
-            nn.Flatten()
+        self.crop_size = crop_size
+        
+        # Nombre de neurones d'entrée pour la carte locale (Terre, Wind_U, Wind_V)
+        flattened_map_size = 3 * crop_size * crop_size
+        
+        # Branche de perception locale
+        self.map_encoder = nn.Sequential(
+            nn.Linear(flattened_map_size, 64),
+            nn.ReLU()
         )
         
-        # Branche vectorielle (Vitesse, But, Vent)
-        self.mlp = nn.Sequential(nn.Linear(5, 32), nn.ReLU())
-        
-        # Calcul de la taille de sortie CNN (ici 32 filtres * 16x16 pixels après MaxPool)
-        cnn_out_size = 32 * (crop_size // 2) * (crop_size // 2)
-        
-        self.actor = nn.Sequential(
-            nn.Linear(cnn_out_size + 32, 128), nn.ReLU(),
-            nn.Linear(128, n_actions), nn.Softmax(dim=-1)
+        # Branche scalaire (Vitesse, But, Delta Vent, Position Absolue)
+        # On passe à 7 entrées pour aider l'agent avec les bordures (x_norm, y_norm)
+        self.scalar_encoder = nn.Sequential(
+            nn.Linear(7, 32),
+            nn.ReLU()
         )
-        self.critic = nn.Sequential(
-            nn.Linear(cnn_out_size + 32, 128), nn.ReLU(),
-            nn.Linear(128, 1)
+        
+        # Tête commune
+        self.shared = nn.Sequential(
+            nn.Linear(64 + 32, 128),
+            nn.ReLU()
         )
+        
+        self.actor = nn.Linear(128, n_actions)
+        self.critic = nn.Linear(128, 1)
 
     def forward(self, local_map, scalars):
-        x_cnn = self.cnn(local_map)
-        x_mlp = self.mlp(scalars)
-        combined = torch.cat([x_cnn, x_mlp], dim=1)
-        return self.actor(combined), self.critic(combined)
+        # On aplatit le crop (batch, 3, 7, 7) -> (batch, 147)
+        x_map = torch.flatten(local_map, start_dim=1)
+        x_map = self.map_encoder(x_map)
+        
+        x_scalar = self.scalar_encoder(scalars)
+        
+        x = torch.cat([x_map, x_scalar], dim=1)
+        x = self.shared(x)
+        
+        probs = F.softmax(self.actor(x), dim=-1)
+        value = self.critic(x)
+        
+        return probs, value
 
 class Memory:
     """Buffer pour stocker les trajectoires avant l'update PPO."""
@@ -69,7 +93,7 @@ class Memory:
         self.logprobs.clear(); self.rewards.clear(); self.is_terminals.clear()
 
 class PPOSailingAgent:
-    def __init__(self, crop_size=32):
+    def __init__(self, crop_size=CROP_SIZE):
         self.crop_size = crop_size
         self.policy = SailingNet(crop_size=crop_size)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=LR)
@@ -82,7 +106,6 @@ class PPOSailingAgent:
         self.loss_history = {'actor': [], 'critic': []}
 
     def get_local_crop(self, obs):
-        """Extrait une fenêtre 3x32x32 autour du bateau (Terre + Vent U/V)."""
         pos = obs[0:2].astype(int)
         wmap = obs[32774:49158].reshape(128, 128)
         wfield = obs[6:32774].reshape(128, 128, 2)
@@ -94,8 +117,10 @@ class PPOSailingAgent:
         
         y, x = pos[1] + pad, pos[0] + pad
         crop = np.zeros((3, self.crop_size, self.crop_size))
-        crop[0] = wmap_p[y-pad:y+pad, x-pad:x+pad]
-        crop[1:] = wf_p[y-pad:y+pad, x-pad:x+pad].transpose(2, 0, 1)
+        
+        crop[0] = wmap_p[y-pad : y+pad+1, x-pad : x+pad+1]
+        crop[1:] = wf_p[y-pad : y+pad+1, x-pad : x+pad+1].transpose(2, 0, 1)
+        
         return torch.FloatTensor(crop).unsqueeze(0)
 
     def select_action(self, obs, goal, prev_angle):
@@ -105,8 +130,11 @@ class PPOSailingAgent:
             curr_w = obs[4:6]
             curr_a = np.arctan2(curr_w[1], curr_w[0])
             da = curr_a - prev_angle if prev_angle else 0
+
+            x_norm = obs[0] / 128.0
+            y_norm = obs[1] / 128.0
             
-            s_input = torch.FloatTensor([obs[2], obs[3], goal[0]-obs[0], goal[1]-obs[1], da]).unsqueeze(0)
+            s_input = torch.FloatTensor([obs[2], obs[3], goal[0]-obs[0], goal[1]-obs[1], da, x_norm, y_norm]).unsqueeze(0)
             
             probs, _ = self.policy_old(m_input, s_input)
             dist = Categorical(probs)
@@ -123,8 +151,7 @@ class PPOSailingAgent:
             discounted_r = r + (GAMMA * discounted_r)
             rewards.insert(0, discounted_r)
         
-        rewards = torch.tensor(rewards, dtype=torch.float32)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+        returns = torch.tensor(rewards, dtype=torch.float32)
 
         # Conversion buffer
         map_s = torch.cat(memory.states_map); sca_s = torch.cat(memory.states_scalars)
@@ -135,13 +162,14 @@ class PPOSailingAgent:
             dist = Categorical(probs)
             
             ratios = torch.exp(dist.log_prob(act_s) - lp_s)
-            adv = rewards - vals.detach().squeeze()
+            advantages = returns - vals.detach().squeeze()
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             
-            surr1 = ratios * adv
-            surr2 = torch.clamp(ratios, 0.8, 1.2) * adv
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 0.8, 1.2) * advantages
             
             a_loss = -torch.min(surr1, surr2).mean()
-            c_loss = 0.5 * F.mse_loss(vals.squeeze(), rewards)
+            c_loss = 0.5 * F.mse_loss(vals.squeeze(), returns)
             
             self.optimizer.zero_grad()
             (a_loss + c_loss - 0.01 * dist.entropy().mean()).backward()
@@ -159,23 +187,19 @@ class PPOSailingAgent:
 # --- Boucle Principale ---
 agent = PPOSailingAgent(CROP_SIZE)
 memory = Memory()
-history = {'rewards': [], 'success': [], 'steps': []}
-scenario_stats = {s: {'rewards': [], 'success': [], 'steps': []} for s in SCENARIOS}
+history = {s: {'rewards': [], 'collision': [], 'success': [], 'steps': [], 'shaped_rewards': []} for s in SCENARIOS}
+scenario_stats = {s: {'rewards': [], 'collision': [], 'success': [], 'steps': [], 'shaped_rewards': []} for s in SCENARIOS}
 total_step = 0
 
 for ep in tqdm(range(NUM_EPISODES)):
     scenario = SCENARIOS[ep % 3]
     env = SailingEnv(**get_wind_scenario(scenario))
     
-    # --- Gestion dynamique des options de Reset (Curriculum) ---
+    # --- Options de Reset ---
     options = {}
     if ep > RANDOM_START_EP:
-        rx = int(np.random.randint(5, 123)) 
-        ry = int(np.random.randint(5, 123))
         options["random_start"] = True
-        options["start_position"] = [rx, ry] 
         options["wind_start_steps"] = int(np.random.randint(0, 100))
-        ep_steps = options["wind_start_steps"]
 
     if ep > RANDOM_VELO_EP:
         options["random_velocity"] = True
@@ -183,7 +207,6 @@ for ep in tqdm(range(NUM_EPISODES)):
     obs, info = env.reset(options=options)
     goal = env.goal_position
     
-    # CRITIQUE : Recalculer la distance après le reset (surtout si random_start)
     p_angle = None
     p_dist = np.linalg.norm(info['position'] - goal)
     ep_r = 0
@@ -197,24 +220,29 @@ for ep in tqdm(range(NUM_EPISODES)):
         act, lp, p_angle, m_in, s_in = agent.select_action(obs, goal, p_angle)
         next_obs, r, done, trunc, info = env.step(act)
         
-        # --- Reward Shaping avec Border Penalty ---
-        speed = np.linalg.norm(next_obs[2:4]) # Vitesse actuelle
+        # --- Reward Shaping ---
+        speed = np.linalg.norm(next_obs[2:4])
         curr_dist = np.linalg.norm(info['position'] - goal)
         x, y = info['position']
         
-        # 1. Progression vers le but
-        shaped_r = r + (p_dist - curr_dist) * 0.1 
+        # 1. Progression
+        shaped_r = r + (p_dist - curr_dist) * PROGRESS_REWARD_SCALE
         
-        # 2. Malus Stagnation (speed < 0.1)
-        if speed < 0.1: shaped_r -= 0.5
+        # 2. Malus Stagnation
+        if speed > SPEED_REWARD_THRESHOLD: 
+            shaped_r += SPEED_REWARD
         
-        # 3. Malus Bordure (si à moins de 5 unités du bord 128x128)
-        if x < 5 or x > 123 or y < 5 or y > 123:
-            shaped_r -= 1.0
+        # 3. Malus Bordure
+        if x < BORDER_PENALTY_THRESHOLD or x > 128 - BORDER_PENALTY_THRESHOLD \
+            or y < BORDER_PENALTY_THRESHOLD or y > 128 - BORDER_PENALTY_THRESHOLD:
+            shaped_r += BORDER_PENALTY
             
         # 4. Collision
-        if info.get('is_stuck', False): shaped_r = -20.0
-        
+        collision = info.get('is_stuck', False)
+        if collision:
+            shaped_r = COLLISION_PENALTY
+            done = True
+
         memory.states_map.append(m_in); memory.states_scalars.append(s_in)
         memory.actions.append(act); memory.logprobs.append(lp)
         memory.rewards.append(shaped_r); memory.is_terminals.append(done or trunc)
@@ -223,24 +251,27 @@ for ep in tqdm(range(NUM_EPISODES)):
 
         if total_step % UPDATE_TIMESTEP == 0:
             agent.update(memory); memory.clear()
-        if done or trunc: break
+            
+        if done or trunc: 
+            break
     
-    # --- Logs & Stats ---
+    # --- Enregistrement des données ---
     agent.scheduler.step()
     
-    # On ne logue les steps que si l'épisode est un succès (done et pas trunc)
-    actual_steps = ep_steps if done else 500 
-    
-    history['rewards'].append(ep_r)
-    history['success'].append(1 if done else 0)
-    history['steps'].append(actual_steps)
+    history[scenario]['rewards'].append(ep_r)
+    history[scenario]['shaped_rewards'].append(shaped_r)
+    history[scenario]['collision'].append(1 if collision else 0)
+    history[scenario]['success'].append(1 if (done and not collision) else 0)
+    history[scenario]['steps'].append(ep_steps if not collision else None)
     
     scenario_stats[scenario]['rewards'].append(ep_r)
-    scenario_stats[scenario]['success'].append(1 if done else 0)
-    scenario_stats[scenario]['steps'].append(actual_steps)
+    scenario_stats[scenario]['shaped_rewards'].append(shaped_r)
+    scenario_stats[scenario]['collision'].append(1 if collision else 0)
+    scenario_stats[scenario]['success'].append(1 if (done and not collision) else 0)
+    scenario_stats[scenario]['steps'].append(ep_steps if not collision else None)
 
-    # --- Affichage périodique tous les 30 épisodes ---
-    if (ep + 1) % 30 == 0:
+    # --- Affichage Bilan ---
+    if (ep + 1) % SUMMARY_STEP_SIZE == 0:
         curr_lr = agent.optimizer.param_groups[0]['lr']
         print(f"\n--- Bilan Eps {ep-28}-{ep+1} | LR: {curr_lr:.2e} ---")
         
@@ -248,15 +279,23 @@ for ep in tqdm(range(NUM_EPISODES)):
             s_data = scenario_stats[s]
             sr = np.mean(s_data['success']) * 100
             rw = np.mean(s_data['rewards'])
-            # Moyenne des steps uniquement sur les réussites pour voir la qualité
-            success_steps = [st for st, succ in zip(s_data['steps'], s_data['success']) if succ == 1]
-            avg_step = np.mean(success_steps) if success_steps else 500
+            srw = np.mean(s_data['shaped_rewards'])
+            col = np.mean(s_data['collision']) * 100
             
-            indicator = "⭐" if avg_step < 60 else "📈" if avg_step < 90 else "🐌"
-            print(f"[{s:10s}] Success: {sr:3.0f}% | Reward: {rw:5.1f} | Steps: {avg_step:4.1f} {indicator}")
+            # Calcul de la moyenne des steps uniquement sur les valeurs non-None
+            valid_steps = [st for st in s_data['steps'] if st is not None]
             
-        # Reset des stats locales
-        scenario_stats = {s: {'rewards': [], 'success': [], 'steps': []} for s in SCENARIOS}
+            if len(valid_steps) > 0:
+                avg_step = np.mean(valid_steps)
+                avg_collision = col
+                step_str = f"{avg_step:4.1f}"
+                indicator = "⭐" if avg_step < 60 else "📈" if avg_step < 90 else "🐌"
+            else:
+                step_str = "--- "
+                indicator = "❌"
+            
+            print(f"[{s:10s}] Success: {sr:3.0f}% | Collision: {avg_collision:4.1f}% | Reward: {rw:5.1f} | Shaped Reward: {srw:5.1f} | Steps: {step_str} {indicator}")
+            
+        scenario_stats = {s: {'rewards': [], 'collision': [], 'success': [], 'steps': [], 'shaped_rewards': []} for s in SCENARIOS}
 
-agent.save("alea_model.pth")
-np.savez("history.npz", **history)
+agent.save("mlp_model.pth")
