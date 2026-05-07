@@ -129,36 +129,56 @@ class SailingEnv(gym.Env): # type: ignore
         return [seed]
 
     def reset(self, seed=None, options=None):
-        """Reset the environment to its initial state."""
-        # Initialize or reset the random number generator
+        """
+        Reset l'environnement. Gère les options sans altérer 
+        le comportement par défaut (entiers) pour la position.
+        """
+        # 1. Initialisation de base (Identique au reset initial)
         self.seed(seed)
-
-        # Reset position to bottom center
-        self.position = np.array([self.grid_size[0] // 2, 0])
-
-        # Reset velocity
-        self.velocity = np.array([0.0, 0.0])
-
-        # Reset step count and last action
         self.step_count = 0
         self.last_action = None
-
-        # Reset position history for trajectory visualization
-        self.position_history = [self.position.copy()]
-
-        # Generate new wind field
-        self.wind_field = None
-        self._generate_wind_field()
-
-        # Create world map (island(s))
+        self.is_stuck = False
+        
+        # Génération du monde (nécessaire pour vérifier la validité du spawn aléatoire)
         self.world_map = self._create_world()
         self.island_layer = build_island_layer(self.world_map)
-        self.is_stuck = False
 
-        # Get initial observation
+        # 2. Gestion de la Position (On reste en INT pour éviter l'IndexError plus tard)
+        if options and "start_position" in options:
+            self.position = np.array(options["start_position"], dtype=int)
+        elif options and options.get("random_start", False):
+            valid_spawn = False
+            while not valid_spawn:
+                rx = np.random.randint(5, self.grid_size[0] - 5)
+                ry = np.random.randint(5, self.grid_size[1] - 5)
+                if self.world_map[ry, rx] == 0:
+                    self.position = np.array([rx, ry], dtype=int) # Forçage en int
+                    valid_spawn = True
+        else:
+            # Position par défaut (Comportement initial exact)
+            self.position = np.array([self.grid_size[0] // 2, 0], dtype=int)
+
+        # 3. Gestion de la Vitesse
+        if options and "start_velocity" in options:
+            self.velocity = np.array(options["start_velocity"], dtype=float)
+        elif options and options.get("random_velocity", False):
+            angle = np.random.uniform(0, 2 * np.pi)
+            speed = np.random.uniform(0, 4.0)
+            self.velocity = np.array([np.cos(angle) * speed, np.sin(angle) * speed])
+        else:
+            self.velocity = np.array([0.0, 0.0])
+
+        # 4. Historique et Vent
+        self.position_history = [self.position.copy()]
+        self.wind_field = None
+        self._generate_wind_field()
+        
+        if options and "wind_start_steps" in options:
+            for _ in range(options["wind_start_steps"]):
+                self._update_wind_field()
+
+        # 5. Finalisation (Identique au reset initial)
         observation = self._get_observation()
-
-        # Get info
         info = {
             'position': self.position,
             'velocity': self.velocity,

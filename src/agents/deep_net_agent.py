@@ -8,7 +8,7 @@ except ImportError:
 # from evaluator.base_agent import BaseAgent
 
 class NumpyWindMasterAgent(BaseAgent):
-    def __init__(self, weights_path="final_model.npz", crop_size=32):
+    def __init__(self, weights_path="alea_model.npz", crop_size=32):
         super().__init__()
         self.crop_size = crop_size
         self.weights = np.load(weights_path)

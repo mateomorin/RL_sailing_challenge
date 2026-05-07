@@ -19,6 +19,12 @@ UPDATE_TIMESTEP = 2000
 SCENARIOS = ['training_1', 'training_2', 'training_3']
 CROP_SIZE = 32
 
+# --- Configuration du Curriculum ---
+# On commence à introduire l'aléa après 1/3 de l'entraînement
+RANDOM_START_EP = NUM_EPISODES // 3  
+# On introduit la vitesse initiale après 2/3
+RANDOM_VELO_EP = (2 * NUM_EPISODES) // 3 
+
 class SailingNet(nn.Module):
     """Architecture hybride CNN + MLP pour le traitement des cartes et vecteurs."""
     def __init__(self, crop_size=32, n_actions=9):
@@ -153,31 +159,60 @@ class PPOSailingAgent:
 # --- Boucle Principale ---
 agent = PPOSailingAgent(CROP_SIZE)
 memory = Memory()
-history = {'rewards': [], 'success': []}
-scenario_stats = {s: {'rewards': [], 'success': []} for s in SCENARIOS}
+history = {'rewards': [], 'success': [], 'steps': []}
+scenario_stats = {s: {'rewards': [], 'success': [], 'steps': []} for s in SCENARIOS}
 total_step = 0
 
 for ep in tqdm(range(NUM_EPISODES)):
     scenario = SCENARIOS[ep % 3]
     env = SailingEnv(**get_wind_scenario(scenario))
-    obs, info = env.reset(); goal = env.goal_position
     
-    p_angle, p_dist = None, np.linalg.norm(info['position'] - goal)
+    # --- Gestion dynamique des options de Reset (Curriculum) ---
+    options = {}
+    if ep > RANDOM_START_EP:
+        rx = int(np.random.randint(5, 123)) 
+        ry = int(np.random.randint(5, 123))
+        options["random_start"] = True
+        options["start_position"] = [rx, ry] 
+        options["wind_start_steps"] = int(np.random.randint(0, 100))
+        ep_steps = options["wind_start_steps"]
+
+    if ep > RANDOM_VELO_EP:
+        options["random_velocity"] = True
+        
+    obs, info = env.reset(options=options)
+    goal = env.goal_position
+    
+    # CRITIQUE : Recalculer la distance après le reset (surtout si random_start)
+    p_angle = None
+    p_dist = np.linalg.norm(info['position'] - goal)
     ep_r = 0
+    ep_steps = 0
 
     for t in range(500):
         total_step += 1
+        ep_steps += 1
         
         # Action & Store
         act, lp, p_angle, m_in, s_in = agent.select_action(obs, goal, p_angle)
         next_obs, r, done, trunc, info = env.step(act)
         
-        # Reward Shaping
-        speed = np.linalg.norm(obs[2:4])
+        # --- Reward Shaping avec Border Penalty ---
+        speed = np.linalg.norm(next_obs[2:4]) # Vitesse actuelle
         curr_dist = np.linalg.norm(info['position'] - goal)
+        x, y = info['position']
         
-        shaped_r = r + (p_dist - curr_dist) * 0.1 # Bonus distance réduit
-        if speed < 0.1: shaped_r -= 0.5            # Malus stagnation
+        # 1. Progression vers le but
+        shaped_r = r + (p_dist - curr_dist) * 0.1 
+        
+        # 2. Malus Stagnation (speed < 0.1)
+        if speed < 0.1: shaped_r -= 0.5
+        
+        # 3. Malus Bordure (si à moins de 5 unités du bord 128x128)
+        if x < 5 or x > 123 or y < 5 or y > 123:
+            shaped_r -= 1.0
+            
+        # 4. Collision
         if info.get('is_stuck', False): shaped_r = -20.0
         
         memory.states_map.append(m_in); memory.states_scalars.append(s_in)
@@ -190,19 +225,38 @@ for ep in tqdm(range(NUM_EPISODES)):
             agent.update(memory); memory.clear()
         if done or trunc: break
     
-    # Logs
+    # --- Logs & Stats ---
     agent.scheduler.step()
-    history['rewards'].append(ep_r); history['success'].append(1 if done else 0)
+    
+    # On ne logue les steps que si l'épisode est un succès (done et pas trunc)
+    actual_steps = ep_steps if done else 500 
+    
+    history['rewards'].append(ep_r)
+    history['success'].append(1 if done else 0)
+    history['steps'].append(actual_steps)
+    
     scenario_stats[scenario]['rewards'].append(ep_r)
     scenario_stats[scenario]['success'].append(1 if done else 0)
+    scenario_stats[scenario]['steps'].append(actual_steps)
 
-    # Affichage périodique
+    # --- Affichage périodique tous les 30 épisodes ---
     if (ep + 1) % 30 == 0:
-        print(f"\n--- Bilan Eps {ep-28}-{ep+1} | LR: {agent.optimizer.param_groups[0]['lr']:.2e} ---")
+        curr_lr = agent.optimizer.param_groups[0]['lr']
+        print(f"\n--- Bilan Eps {ep-28}-{ep+1} | LR: {curr_lr:.2e} ---")
+        
         for s in SCENARIOS:
-            sr = np.mean(scenario_stats[s]['success']) * 100
-            rw = np.mean(scenario_stats[s]['rewards'])
-            print(f"[{s:10s}] Success: {sr:3.0f}% | Avg Reward: {rw:5.1f}")
-        scenario_stats = {s: {'rewards': [], 'success': []} for s in SCENARIOS}
+            s_data = scenario_stats[s]
+            sr = np.mean(s_data['success']) * 100
+            rw = np.mean(s_data['rewards'])
+            # Moyenne des steps uniquement sur les réussites pour voir la qualité
+            success_steps = [st for st, succ in zip(s_data['steps'], s_data['success']) if succ == 1]
+            avg_step = np.mean(success_steps) if success_steps else 500
+            
+            indicator = "⭐" if avg_step < 60 else "📈" if avg_step < 90 else "🐌"
+            print(f"[{s:10s}] Success: {sr:3.0f}% | Reward: {rw:5.1f} | Steps: {avg_step:4.1f} {indicator}")
+            
+        # Reset des stats locales
+        scenario_stats = {s: {'rewards': [], 'success': [], 'steps': []} for s in SCENARIOS}
 
-agent.save("final_model.pth")
+agent.save("alea_model.pth")
+np.savez("history.npz", **history)
