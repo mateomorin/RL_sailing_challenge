@@ -2,12 +2,12 @@ import numpy as np
 import sys
 import os
 
-# try:
-#     from base_agent import BaseAgent
-# except ImportError:
-#     from agents.base_agent import BaseAgent
+try:
+    from base_agent import BaseAgent
+except ImportError:
+    from agents.base_agent import BaseAgent
 
-from evaluator.base_agent import BaseAgent
+# from evaluator.base_agent import BaseAgent
 
 
 def calculate_sailing_efficiency(boat_direction, wind_direction):
