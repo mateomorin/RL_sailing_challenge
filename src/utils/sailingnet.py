@@ -3,198 +3,206 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+from torch.distributions import Categorical
 import torch.optim as optim
+import numpy as np
+
 
 from src.env_sailing import SailingEnv
 from src.wind_scenarios import get_wind_scenario
 
+# --- Configuration ---
+NUM_EPISODES = 1000
+GAMMA = 0.995
+LR = 1e-4
+UPDATE_TIMESTEP = 2000 
+SCENARIOS = ['training_1', 'training_2', 'training_3']
+CROP_SIZE = 32
+
 class SailingNet(nn.Module):
+    """Architecture hybride CNN + MLP pour le traitement des cartes et vecteurs."""
     def __init__(self, crop_size=32, n_actions=9):
         super().__init__()
-        self.crop_size = crop_size
-        
-        # Branche CNN : Traite le crop local (3 canaux : Terre, Wind_U, Wind_V)
+        # Branche spatiale (Local Crop)
         self.cnn = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
+            nn.Conv2d(3, 16, kernel_size=3, padding=1), nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU(),
             nn.Flatten()
         )
         
-        # Branche Scalaire : [vx, vy, dx_goal, dy_goal, wind_angle_delta]
-        # On calcule wind_angle_delta en comparant le vent actuel au précédent
-        self.mlp = nn.Sequential(
-            nn.Linear(5, 32),
-            nn.ReLU()
-        )
+        # Branche vectorielle (Vitesse, But, Vent)
+        self.mlp = nn.Sequential(nn.Linear(5, 32), nn.ReLU())
         
-        # Fusion des deux branches
-        # Taille CNN (32x16x16 si crop=32 et 1 pool) = 8192 (à ajuster selon crop)
+        # Calcul de la taille de sortie CNN (ici 32 filtres * 16x16 pixels après MaxPool)
         cnn_out_size = 32 * (crop_size // 2) * (crop_size // 2)
         
         self.actor = nn.Sequential(
-            nn.Linear(cnn_out_size + 32, 128),
-            nn.ReLU(),
-            nn.Linear(128, n_actions),
-            nn.Softmax(dim=-1)
+            nn.Linear(cnn_out_size + 32, 128), nn.ReLU(),
+            nn.Linear(128, n_actions), nn.Softmax(dim=-1)
         )
-        
         self.critic = nn.Sequential(
-            nn.Linear(cnn_out_size + 32, 128),
-            nn.ReLU(),
+            nn.Linear(cnn_out_size + 32, 128), nn.ReLU(),
             nn.Linear(128, 1)
         )
 
     def forward(self, local_map, scalars):
         x_cnn = self.cnn(local_map)
         x_mlp = self.mlp(scalars)
-        x_combined = torch.cat([x_cnn, x_mlp], dim=1)
-        
-        probs = self.actor(x_combined)
-        value = self.critic(x_combined)
-        return probs, value
+        combined = torch.cat([x_cnn, x_mlp], dim=1)
+        return self.actor(combined), self.critic(combined)
 
+class Memory:
+    """Buffer pour stocker les trajectoires avant l'update PPO."""
+    def __init__(self):
+        self.actions, self.states_map, self.states_scalars = [], [], []
+        self.logprobs, self.rewards, self.is_terminals = [], [], []
 
-class DeepSailingAgent:
+    def clear(self):
+        self.actions.clear(); self.states_map.clear(); self.states_scalars.clear()
+        self.logprobs.clear(); self.rewards.clear(); self.is_terminals.clear()
+
+class PPOSailingAgent:
     def __init__(self, crop_size=32):
-        self.model = SailingNet(crop_size=crop_size)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0007)
         self.crop_size = crop_size
-        self.prev_wind = None
-
-    def get_local_crop(self, observation):
-        pos = observation[0:2].astype(int)
-        # Extraire World Map (32774:49158) et Wind Field (6:32774)
-        wmap = observation[32774:49158].reshape(128, 128)
-        wfield = observation[6:32774].reshape(128, 128, 2)
+        self.policy = SailingNet(crop_size=crop_size)
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=LR)
+        # Décroissance du LR sur la durée totale
+        self.scheduler = optim.lr_scheduler.LinearLR(self.optimizer, start_factor=1.0, end_factor=0.1, total_iters=NUM_EPISODES)
         
-        # Padding pour gérer les bords
+        self.policy_old = SailingNet(crop_size=crop_size)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        
+        self.loss_history = {'actor': [], 'critic': []}
+
+    def get_local_crop(self, obs):
+        """Extrait une fenêtre 3x32x32 autour du bateau (Terre + Vent U/V)."""
+        pos = obs[0:2].astype(int)
+        wmap = obs[32774:49158].reshape(128, 128)
+        wfield = obs[6:32774].reshape(128, 128, 2)
         pad = self.crop_size // 2
-        wmap_padded = np.pad(wmap, pad, constant_values=1)
-        wfield_padded = np.pad(wfield, ((pad,pad),(pad,pad),(0,0)), constant_values=0)
         
-        # Crop centré sur pos (ajusté avec le padding)
+        # Padding constant pour les bords de map
+        wmap_p = np.pad(wmap, pad, constant_values=1)
+        wf_p = np.pad(wfield, ((pad, pad), (pad, pad), (0, 0)), constant_values=0)
+        
         y, x = pos[1] + pad, pos[0] + pad
-        crop_wmap = wmap_padded[y-pad:y+pad, x-pad:x+pad]
-        crop_wfield = wfield_padded[y-pad:y+pad, x-pad:x+pad]
+        crop = np.zeros((3, self.crop_size, self.crop_size))
+        crop[0] = wmap_p[y-pad:y+pad, x-pad:x+pad]
+        crop[1:] = wf_p[y-pad:y+pad, x-pad:x+pad].transpose(2, 0, 1)
+        return torch.FloatTensor(crop).unsqueeze(0)
+
+    def select_action(self, obs, goal, prev_angle):
+        """Calcule les inputs et sélectionne une action selon la vieille politique."""
+        with torch.no_grad():
+            m_input = self.get_local_crop(obs)
+            curr_w = obs[4:6]
+            curr_a = np.arctan2(curr_w[1], curr_w[0])
+            da = curr_a - prev_angle if prev_angle else 0
+            
+            s_input = torch.FloatTensor([obs[2], obs[3], goal[0]-obs[0], goal[1]-obs[1], da]).unsqueeze(0)
+            
+            probs, _ = self.policy_old(m_input, s_input)
+            dist = Categorical(probs)
+            action = dist.sample()
+            
+            return action.item(), dist.log_prob(action), curr_a, m_input, s_input
+
+    def update(self, memory):
+        # Calcul des Returns normalisés
+        rewards = []
+        discounted_r = 0
+        for r, term in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
+            if term: discounted_r = 0
+            discounted_r = r + (GAMMA * discounted_r)
+            rewards.insert(0, discounted_r)
         
-        # Concatenate: [Terre, Wind_U, Wind_V] -> shape (3, crop, crop)
-        combined = np.zeros((3, self.crop_size, self.crop_size))
-        combined[0] = crop_wmap
-        combined[1:] = crop_wfield.transpose(2, 0, 1)
-        return torch.FloatTensor(combined).unsqueeze(0)
+        rewards = torch.tensor(rewards, dtype=torch.float32)
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-    def train_step(self, obs, goal, prev_wind_angle):
-        # 1. Prépare Inputs
-        local_map = self.get_local_crop(obs)
-        curr_wind = obs[4:6]
-        curr_angle = np.arctan2(curr_wind[1], curr_wind[0])
-        angle_delta = curr_angle - prev_wind_angle if prev_wind_angle else 0
+        # Conversion buffer
+        map_s = torch.cat(memory.states_map); sca_s = torch.cat(memory.states_scalars)
+        act_s = torch.tensor(memory.actions); lp_s = torch.stack(memory.logprobs).detach()
+
+        for _ in range(5): # K-epochs
+            probs, vals = self.policy(map_s, sca_s)
+            dist = Categorical(probs)
+            
+            ratios = torch.exp(dist.log_prob(act_s) - lp_s)
+            adv = rewards - vals.detach().squeeze()
+            
+            surr1 = ratios * adv
+            surr2 = torch.clamp(ratios, 0.8, 1.2) * adv
+            
+            a_loss = -torch.min(surr1, surr2).mean()
+            c_loss = 0.5 * F.mse_loss(vals.squeeze(), rewards)
+            
+            self.optimizer.zero_grad()
+            (a_loss + c_loss - 0.01 * dist.entropy().mean()).backward()
+            self.optimizer.step()
+            
+            self.loss_history['actor'].append(a_loss.item())
         
-        to_goal = goal - obs[0:2]
-        scalars = torch.FloatTensor([obs[2], obs[3], to_goal[0], to_goal[1], angle_delta]).unsqueeze(0)
-        
-        # 2. Forward
-        probs, value = self.model(local_map, scalars)
-        return probs, value, curr_angle
+        self.policy_old.load_state_dict(self.policy.state_dict())
 
+    def save(self, path):
+        torch.save(self.policy.state_dict(), path)
+        weights = {n: p.detach().cpu().numpy() for n, p in self.policy.named_parameters()}
+        np.savez(path.replace(".pth", ".npz"), **weights)
 
-# --- Initialisation ---
-agent = DeepSailingAgent()
-num_episodes = 2000
-gamma = 0.995
-np.random.seed(42)
-scenarios = ['training_1', 'training_2', 'training_3']
+# --- Boucle Principale ---
+agent = PPOSailingAgent(CROP_SIZE)
+memory = Memory()
+history = {'rewards': [], 'success': []}
+scenario_stats = {s: {'rewards': [], 'success': []} for s in SCENARIOS}
+total_step = 0
 
-# Historique complet pour analyse post-entraînement
-history = {
-    'episode_reward': [],
-    'actor_loss': [],
-    'critic_loss': [],
-    'total_loss': [],
-    'steps': [],
-    'success': []
-}
-
-print(f"Starting training: {num_episodes} episodes...")
-
-for ep in tqdm(range(num_episodes)):
-    scenario = scenarios[ep % 3]
+for ep in tqdm(range(NUM_EPISODES)):
+    scenario = SCENARIOS[ep % 3]
     env = SailingEnv(**get_wind_scenario(scenario))
-    obs, info = env.reset()
+    obs, info = env.reset(); goal = env.goal_position
     
-    log_probs, values, rewards = [], [], []
-    prev_angle = None
-    prev_dist = np.linalg.norm(info['position'] - env.goal_position)
-    ep_total_raw_reward = 0  # On stocke la reward brute de l'env pour le monitoring
+    p_angle, p_dist = None, np.linalg.norm(info['position'] - goal)
+    ep_r = 0
 
-    # --- Episode Loop ---
     for t in range(500):
-        probs, val, prev_angle = agent.train_step(obs, env.goal_position, prev_angle)
+        total_step += 1
         
-        dist = torch.distributions.Categorical(probs)
-        action = dist.sample()
+        # Action & Store
+        act, lp, p_angle, m_in, s_in = agent.select_action(obs, goal, p_angle)
+        next_obs, r, done, trunc, info = env.step(act)
         
-        next_obs, reward, done, truncated, info = env.step(action.item())
+        # Reward Shaping
+        speed = np.linalg.norm(obs[2:4])
+        curr_dist = np.linalg.norm(info['position'] - goal)
         
-        # Reward Shaping pour l'apprentissage
-        curr_dist = np.linalg.norm(info['position'] - env.goal_position)
-        shaped_reward = reward + (prev_dist - curr_dist) * 0.5
-        if info.get('is_stuck', False): shaped_reward = -20.0
+        shaped_r = r + (p_dist - curr_dist) * 0.1 # Bonus distance réduit
+        if speed < 0.1: shaped_r -= 0.5            # Malus stagnation
+        if info.get('is_stuck', False): shaped_r = -20.0
         
-        log_probs.append(dist.log_prob(action))
-        values.append(val)
-        rewards.append(shaped_reward)
-        
-        ep_total_raw_reward += reward
-        obs = next_obs
-        prev_dist = curr_dist
-        if done or truncated: break
+        memory.states_map.append(m_in); memory.states_scalars.append(s_in)
+        memory.actions.append(act); memory.logprobs.append(lp)
+        memory.rewards.append(shaped_r); memory.is_terminals.append(done or trunc)
 
-    # --- Update Policy (A2C) ---
-    returns = []
-    R = 0
-    for r in reversed(rewards):
-        R = r + gamma * R
-        returns.insert(0, R)
+        obs, ep_r, p_dist = next_obs, ep_r + r, curr_dist
+
+        if total_step % UPDATE_TIMESTEP == 0:
+            agent.update(memory); memory.clear()
+        if done or trunc: break
     
-    returns = torch.FloatTensor(returns)
-    log_probs = torch.stack(log_probs)
-    values = torch.cat(values).squeeze()
-    
-    advantage = returns - values.detach()
-    a_loss = -(log_probs * advantage).mean()
-    c_loss = F.mse_loss(values, returns)
-    total_loss = a_loss + 0.5 * c_loss
-    
-    agent.optimizer.zero_grad()
-    total_loss.backward()
-    agent.optimizer.step()
+    # Logs
+    agent.scheduler.step()
+    history['rewards'].append(ep_r); history['success'].append(1 if done else 0)
+    scenario_stats[scenario]['rewards'].append(ep_r)
+    scenario_stats[scenario]['success'].append(1 if done else 0)
 
-    # --- Enregistrement des stats ---
-    history['episode_reward'].append(ep_total_raw_reward)
-    history['actor_loss'].append(a_loss.item())
-    history['critic_loss'].append(c_loss.item())
-    history['total_loss'].append(total_loss.item())
-    history['steps'].append(t + 1)
-    history['success'].append(1 if done else 0)
+    # Affichage périodique
+    if (ep + 1) % 30 == 0:
+        print(f"\n--- Bilan Eps {ep-28}-{ep+1} | LR: {agent.optimizer.param_groups[0]['lr']:.2e} ---")
+        for s in SCENARIOS:
+            sr = np.mean(scenario_stats[s]['success']) * 100
+            rw = np.mean(scenario_stats[s]['rewards'])
+            print(f"[{s:10s}] Success: {sr:3.0f}% | Avg Reward: {rw:5.1f}")
+        scenario_stats = {s: {'rewards': [], 'success': []} for s in SCENARIOS}
 
-    # --- Affichage tous les 20 épisodes ---
-    if (ep + 1) % 20 == 0:
-        avg_rew = np.mean(history['episode_reward'][-20:])
-        avg_loss = np.mean(history['total_loss'][-20:])
-        success_rate = np.mean(history['success'][-20:]) * 100
-        tqdm.write(f"Ep {ep+1:4d} | Reward: {avg_rew:6.1f} | Loss: {avg_loss:8.4f} | Success: {success_rate:3.0f}%")
-
-# --- Sauvegarde finale ---
-# 1. Les poids pour l'agent Numpy
-weights_dict = {name: param.detach().cpu().numpy() for name, param in agent.model.named_parameters()}
-np.savez("sailing_model_weights.npz", **weights_dict)
-
-# 2. L'historique d'entraînement pour analyse (Matplotlib)
-np.savez("training_history.npz", **history)
-
-print("\nTraining Finished! Models and history saved.")
+agent.save("final_model.pth")
