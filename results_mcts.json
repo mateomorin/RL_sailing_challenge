@@ -1,13 +1,13 @@
 {
   "training_1": {
     "mcts": {
-      "success_rate": 0.34,
-      "avg_discounted_score": 19.309144776292648,
-      "avg_steps_on_success": 115.11764705882354,
-      "std_steps_on_success": 21.82249878650924,
-      "crash_rate": 0.66,
+      "success_rate": 1.0,
+      "avg_discounted_score": 74.7297417567663,
+      "avg_steps_on_success": 59.14,
+      "std_steps_on_success": 3.3106494831075066,
+      "crash_rate": 0.0,
       "timeout_rate": 0.0,
-      "avg_time_per_episode_s": 15.07620843410492,
+      "avg_time_per_episode_s": 16.320000824928282,
       "n_episodes": 50
     },
     "windmaster": {
@@ -17,7 +17,7 @@
       "std_steps_on_success": 2.032691795993677,
       "crash_rate": 0.36,
       "timeout_rate": 0.0,
-      "avg_time_per_episode_s": 0.043722410202026364,
+      "avg_time_per_episode_s": 0.06612651824951171,
       "n_episodes": 50
     },
     "mcts_params": {
@@ -31,13 +31,13 @@
   },
   "training_2": {
     "mcts": {
-      "success_rate": 0.16,
-      "avg_discounted_score": 10.523008319207268,
-      "avg_steps_on_success": 84.625,
-      "std_steps_on_success": 3.461845606031557,
-      "crash_rate": 0.84,
+      "success_rate": 1.0,
+      "avg_discounted_score": 71.9279130656333,
+      "avg_steps_on_success": 67.14,
+      "std_steps_on_success": 12.588899872506731,
+      "crash_rate": 0.0,
       "timeout_rate": 0.0,
-      "avg_time_per_episode_s": 14.939337615966798,
+      "avg_time_per_episode_s": 20.27762583255768,
       "n_episodes": 50
     },
     "windmaster": {
@@ -47,7 +47,7 @@
       "std_steps_on_success": 2.6702392242630433,
       "crash_rate": 0.48,
       "timeout_rate": 0.0,
-      "avg_time_per_episode_s": 0.031869235038757326,
+      "avg_time_per_episode_s": 0.036633391380310056,
       "n_episodes": 50
     },
     "mcts_params": {
@@ -61,13 +61,13 @@
   },
   "training_3": {
     "mcts": {
-      "success_rate": 0.58,
-      "avg_discounted_score": 40.57104958690722,
-      "avg_steps_on_success": 72.44827586206897,
-      "std_steps_on_success": 7.721828472478709,
-      "crash_rate": 0.42,
+      "success_rate": 1.0,
+      "avg_discounted_score": 79.25187702015816,
+      "avg_steps_on_success": 47.42,
+      "std_steps_on_success": 3.394642838355753,
+      "crash_rate": 0.0,
       "timeout_rate": 0.0,
-      "avg_time_per_episode_s": 13.869534153938293,
+      "avg_time_per_episode_s": 14.115096025466919,
       "n_episodes": 50
     },
     "windmaster": {
@@ -77,7 +77,7 @@
       "std_steps_on_success": 10.644228483079457,
       "crash_rate": 0.0,
       "timeout_rate": 0.0,
-      "avg_time_per_episode_s": 0.03226653099060059,
+      "avg_time_per_episode_s": 0.03586874008178711,
       "n_episodes": 50
     },
     "mcts_params": {
