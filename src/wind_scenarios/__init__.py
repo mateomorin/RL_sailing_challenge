@@ -51,11 +51,62 @@ TRAINING_3 = {
     }
 }
 
+ADDITIONAL_1 = {
+    'wind_init_params': {
+        'base_speed': 10.0,
+        'base_max_rotation_angle_degree': 10,
+        'pattern' : ( # 3x3 winds (not restricted to 8 directions)
+            ((0.8, -0.6), (0.55, 0.8), (0.85, -0.55)),
+            ((0.2, 1), (1, 0), (-0.8, -0.6)),
+            ((0.85, 0.5), (0.9, 0.4), (0.9, 0.5)),
+        )
+    },  # below are the param of the Gaussian distribution from which noise is sampled at each time-step
+    'wind_evol_params' : {
+        'mean_rotation_angle_degree': 3,
+        'std_rotation_angle_degree': 0.8,
+    }
+}
+
+ADDITIONAL_2 = {
+    'wind_init_params': {
+        'base_speed': 10.0,
+        'base_max_rotation_angle_degree': 10,
+        'pattern' : ( # 3x3 winds (not restricted to 8 directions)
+            ((0.4, -0.9), (0.7, 0.7), (0.9, -0.5)),
+            ((0.2, 1), (1, 0), (-0.6, -0.8)),
+            ((0.9, 0.35), (0.85, 0.5), (0.7, 0.7)),
+        )
+    },  # below are the param of the Gaussian distribution from which noise is sampled at each time-step
+    'wind_evol_params' : {
+        'mean_rotation_angle_degree': 3,
+        'std_rotation_angle_degree': 0.8,
+    }
+}
+
+ADDITIONAL_3 = {
+    'wind_init_params': {
+        'base_speed': 10.0,
+        'base_max_rotation_angle_degree': 10,
+        'pattern' : ( # 3x3 winds (not restricted to 8 directions)
+            ((0.55, -1), (0.55, 0.55), (1, -0.55)),
+            ((0, 1), (1, 0), (-0.55, 1)),
+            ((1, 0.55), (1, 0.55), (0.55, 0.55)),
+        )
+    },  # below are the param of the Gaussian distribution from which noise is sampled at each time-step
+    'wind_evol_params' : {
+        'mean_rotation_angle_degree': 3,
+        'std_rotation_angle_degree': 0.8,
+    }
+}
+
 # Dictionary mapping wind scenario names to their parameters
 WIND_SCENARIOS = {
     'training_1': TRAINING_1,
     'training_2': TRAINING_2,
     'training_3': TRAINING_3,
+    'additional_1': ADDITIONAL_1,
+    'additional_2': ADDITIONAL_2,
+    'additional_3': ADDITIONAL_3,
 }
 
 def get_wind_scenario(name):
@@ -63,7 +114,7 @@ def get_wind_scenario(name):
     Get the parameters for a specific wind scenario.
 
     Args:
-        name: String, one of ['training_1', 'training_2', 'training_3']
+        name: String, one of ['training_1', 'training_2', 'training_3', 'additional_1', 'additional_2', 'additional_3']
 
     Returns:
         Dictionary containing wind_init_params and wind_evol_params
