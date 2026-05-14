@@ -186,31 +186,45 @@ def extract_features(obs: np.ndarray) -> np.ndarray:
         (xr - x) / GRID_SIZE,          # bord droit
     ])
 
-    # [14-15] indicateurs de route
+    # [14-17] indicateurs de route
     above_island = float(y > yt)
     below_island = float(y < yb)
-    feat.extend([above_island, below_island])
+    left_island = float(x < xl)
+    right_island = float(x > xr)
+    feat.extend([above_island, below_island, left_island, right_island])
 
-    # [16-19] vent moyen couloirs NORD et SUD
-    w_north = _zone_mean_wind(wind_field, 0, 127, yt + 1, 127)
-    w_south = _zone_mean_wind(wind_field, 0, 127, 0, yb - 1)
-    w_north_spd = np.linalg.norm(w_north) + 1e-9
-    w_south_spd = np.linalg.norm(w_south) + 1e-9
-    feat.extend([w_north[0] / w_north_spd, w_north[1] / w_north_spd])
-    feat.extend([w_south[0] / w_south_spd, w_south[1] / w_south_spd])
+    # [18-29] vent moyen des couloirs selon l'ile (above_west, above_east, below_west, below_east, left, right)
+    wind_aw = _zone_mean_wind(wind_field, 0, 63, yt + 1, 127)
+    wind_ae = _zone_mean_wind(wind_field, 64, 127, yt + 1, 127)
+    wind_bw = _zone_mean_wind(wind_field, 0, 63, yb - 1, 127)
+    wind_be = _zone_mean_wind(wind_field, 64, 127, yb - 1, 127)
+    wind_l = _zone_mean_wind(wind_field, 0, xl-1, yb, yt)
+    wind_r = _zone_mean_wind(wind_field, 64, xr+1, yb, yt)
+    wind_aw_spd = np.linalg.norm(wind_aw) + 1e-9
+    wind_ae_spd = np.linalg.norm(wind_ae) + 1e-9
+    wind_bw_spd = np.linalg.norm(wind_bw) + 1e-9
+    wind_be_spd = np.linalg.norm(wind_be) + 1e-9
+    wind_l_spd = np.linalg.norm(wind_l) + 1e-9
+    wind_r_spd = np.linalg.norm(wind_r) + 1e-9
+    feat.extend([wind_aw[0] / wind_aw_spd, wind_aw[1] / wind_aw_spd])
+    feat.extend([wind_ae[0] / wind_ae_spd, wind_ae[1] / wind_ae_spd])
+    feat.extend([wind_bw[0] / wind_bw_spd, wind_bw[1] / wind_bw_spd])
+    feat.extend([wind_be[0] / wind_be_spd, wind_be[1] / wind_be_spd])
+    feat.extend([wind_l[0] / wind_l_spd, wind_l[1] / wind_l_spd])
+    feat.extend([wind_r[0] / wind_r_spd, wind_r[1] / wind_r_spd])
 
-    # [20-21] vent moyen zone goal
+    # [30-31] vent moyen zone goal
     w_goal = _zone_mean_wind(wind_field, 44, 84, yt + 1, 127)
     w_goal_spd = np.linalg.norm(w_goal) + 1e-9
     feat.extend([w_goal[0] / w_goal_spd, w_goal[1] / w_goal_spd])
 
-    # [22-23] vent prédit t+1 à position actuelle
+    # [32-33] vent prédit t+1 à position actuelle
     wind_next = _predict_next_wind(wind_field)
     wn = _wind_at(wind_next, x, y)
     wn_spd = np.linalg.norm(wn) + 1e-9
     feat.extend([wn[0] / wn_spd, wn[1] / wn_spd])
 
-    # [24-29] efficacités pour 6 directions clés vs vent local
+    # [34-39] efficacités pour 6 directions clés vs vent local
     key_dirs = [
         (0.0,  1.0),   # N
         (1.0,  1.0),   # NE
@@ -222,14 +236,14 @@ def extract_features(obs: np.ndarray) -> np.ndarray:
     for dx, dy in key_dirs:
         feat.append(_sailing_efficiency(np.array([dx, dy]), np.array([wx, wy])))
 
-    # [30-31] angle et magnitude vent local
+    # [39-40] angle et magnitude vent local
     wind_angle = np.arctan2(wy, wx) / np.pi   # -1..1
     feat.extend([wind_angle, wind_speed / 10.0])
 
-    # [32] placeholder step progress
+    # [41-42] placeholder step progress
     feat.append(0.0)
 
-    # [33-38] vent à 6 points d'anticipation vers le goal
+    # [43-48] vent à 6 points d'anticipation vers le goal
     n_waypoints = 6
     for i in range(1, n_waypoints + 1):
         t = i / (n_waypoints + 1)
@@ -242,7 +256,7 @@ def extract_features(obs: np.ndarray) -> np.ndarray:
         feat.append(eff_wp)
     # On garde seulement les 6 efficacités (indices 33-38)
 
-    # [39-42] vent moyen 4 quadrants pour détecter asymétrie
+    # [49-52] vent moyen 4 quadrants pour détecter asymétrie
     mid = GRID_SIZE // 2
     for (x0, x1, y0, y1) in [
         (0, mid, mid, GRID_SIZE - 1),    # NO
@@ -253,16 +267,16 @@ def extract_features(obs: np.ndarray) -> np.ndarray:
         wq = _zone_mean_wind(wind_field, x0, x1, y0, y1)
         feat.append(np.arctan2(wq[1], wq[0]) / np.pi)
 
-    # [43] avantage route NORD vs SUD
+    # [53] avantage route EST vs OUEST
     # Efficacité si on va plein nord depuis position actuelle dans chaque couloir
-    eff_north_route = _sailing_efficiency(np.array([0.0, 1.0]), w_north)
-    eff_south_route = _sailing_efficiency(np.array([0.0, -1.0]), w_south)
-    feat.append(eff_north_route - eff_south_route)
+    eff_left_route = _sailing_efficiency(np.array([0.0, 1.0]), wind_l)
+    eff_right_route = _sailing_efficiency(np.array([0.0, -1.0]), wind_r)
+    feat.append(eff_left_route - eff_right_route)
 
-    # [44] magnitude vitesse normalisée
+    # [54] magnitude vitesse normalisée
     feat.append(v_speed / 8.0)
 
-    # [45] near-island flag
+    # [55] near-island flag
     dist_to_island = min(
         abs(x - xl), abs(x - xr), abs(y - yb), abs(y - yt)
     )
@@ -271,7 +285,7 @@ def extract_features(obs: np.ndarray) -> np.ndarray:
     return np.array(feat, dtype=np.float32)
 
 
-N_FEATURES = 46
+N_FEATURES = 56
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -372,7 +386,7 @@ def shaped_reward(obs_prev, obs_curr, env_reward, terminated, is_stuck,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def train(
-    save_path="agent_ppo_weights.npz",
+    save_path="agent_ppo_bis_weights.npz",
     n_envs=8,
     total_steps=3_000_000,
     rollout_steps=512,
@@ -748,11 +762,11 @@ class MyAgent(BaseAgent):
 
     Usage :
         agent = MyAgent()
-        agent.load("agent_ppo_weights.npz")
+        agent.load("agent_ppo_bis_weights.npz")
         action = agent.act(observation)
     """
 
-    DEFAULT_WEIGHTS_PATH = "agent_ppo_weights.npz"
+    DEFAULT_WEIGHTS_PATH = "agent_ppo_bis_weights.npz"
 
     def __init__(self, weights_path: str = None):
         super().__init__()
@@ -845,7 +859,7 @@ class MyAgent(BaseAgent):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def evaluate(
-    weights_path="agent_ppo_weights.npz",
+    weights_path="agent_ppo_bis_weights.npz",
     n_episodes=50,
     scenarios=('training_1', 'training_2', 'training_3'),
     seed_offset=9999,
@@ -938,7 +952,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Agent PPO — Sailing Challenge")
     parser.add_argument("--train",      action="store_true", help="Entraîner le modèle")
     parser.add_argument("--eval",       action="store_true", help="Évaluer le modèle")
-    parser.add_argument("--weights",    type=str, default="agent_ppo_weights.npz",
+    parser.add_argument("--weights",    type=str, default="agent_ppo_bis_weights.npz",
                         help="Chemin du fichier de poids (.npz)")
     parser.add_argument("--steps",      type=int, default=3_000_000,
                         help="Nombre total de steps d'entraînement")
