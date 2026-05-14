@@ -1,0 +1,60 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: RL-multi-trainer-
+spec:
+  entrypoint: main-dag
+  lifecycleEventConfig:
+    handler: ""
+  templates:
+    - name: main-dag
+      dag:
+        tasks:
+          - name: train
+            template: trainer
+            arguments:
+              parameters:
+                - name: overrides
+                  value: "{{item.overrides}}"
+            withItems:
+              - {weights: "run_1", overrides: "--lr=1e-4 --rollout=512 --ent_coeff=0.01" }
+              - {weights: "run_2", overrides: "--lr=3e-4 --rollout=512 --ent_coeff=0.01" }
+              - {weights: "run_3", overrides: "--lr=7e-4 --rollout=512 --ent_coeff=0.01" }
+              - {weights: "run_4", overrides: "--lr=1e-3 --rollout=512 --ent_coeff=0.01" }
+              - {weights: "run_5", overrides: "--lr=3e-4 --rollout=256 --ent_coeff=0.01" }
+              - {weights: "run_6", overrides: "--lr=3e-4 --rollout=1024 --ent_coeff=0.01" }
+              - {weights: "run_7", overrides: "--lr=3e-4 --rollout=512 --ent_coeff=0.1" }
+              - {weights: "run_8", overrides: "--lr=3e-4 --rollout=512 --ent_coeff=0.05" }
+              - {weights: "run_9", overrides: "--lr=3e-4 --rollout=512 --ent_coeff=0.15" }
+              - {weights: "run_10", overrides: "--lr=3e-4 --rollout=512 --ent_coeff=0.2" }
+
+    - name: trainer
+      inputs:
+        parameters:
+          - name: overrides
+          - name: weights
+      script:
+        image: "inseefrlab/onyxia-vscode-python:py3.13.5"
+        imagePullPolicy: Always
+        command: ["/bin/bash"]
+        source: |
+          set -e
+          git clone -b main https://github.com/mateomorin/RL_sailing_challenge.git
+          cd RL_sailing_challenge
+          uv run -m src.agents.agent_massive_training --train --device=cpu \
+            {{inputs.parameters.overrides}} \
+            {{inputs.parameters.weights}}
+        resources:
+          limits:
+            cpu: "1000m"
+            memory: "5Gi"
+          requests:
+            cpu: "400m"
+            memory: "1Gi"
+        env:
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom: { secretKeyRef: { name: rl-sailing, key: AWS_ACCESS_KEY_ID } }
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom: { secretKeyRef: { name: rl-sailing, key: AWS_SECRET_ACCESS_KEY } }
+          - name: AWS_SESSION_TOKEN
+            valueFrom: { secretKeyRef: { name: rl-sailing, key: AWS_SESSION_TOKEN } }

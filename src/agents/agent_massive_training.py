@@ -691,7 +691,8 @@ def _save_weights(model, path, metrics=None):
         weights[name] = param.cpu().numpy()
     if metrics:
         weights['_metrics_json'] = np.array([json.dumps(metrics)])
-    np.savez(path, **weights)
+    with fs.open("mamorin/rl_sailing/models/" + path, 'wb') as f:
+        np.savez(f, **weights)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -949,6 +950,13 @@ def evaluate(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import s3fs
+    fs = s3fs.S3FileSystem(
+        client_kwargs={'endpoint_url': 'https://'+'minio.lab.sspcloud.fr'},
+        key=os.environ["AWS_ACCESS_KEY_ID"],
+        secret=os.environ["AWS_SECRET_ACCESS_KEY"],
+        token=os.environ["AWS_SESSION_TOKEN"]
+    )
     parser = argparse.ArgumentParser(description="Agent PPO — Sailing Challenge")
     parser.add_argument("--train",      action="store_true", help="Entraîner le modèle")
     parser.add_argument("--eval",       action="store_true", help="Évaluer le modèle")
@@ -956,7 +964,7 @@ if __name__ == "__main__":
                         help="Chemin du fichier de poids (.npz)")
     parser.add_argument("--steps",      type=int, default=3_000_000,
                         help="Nombre total de steps d'entraînement")
-    parser.add_argument("--n_envs",     type=int, default=50,
+    parser.add_argument("--n_envs",     type=int, default=20,
                         help="Nombre d'environnements parallèles")
     parser.add_argument("--n_eval",     type=int, default=50,
                         help="Nombre d'épisodes d'évaluation")
@@ -968,7 +976,7 @@ if __name__ == "__main__":
                         help="Learning rate")
     parser.add_argument("--ent_coef",   type=float, default=0.01,
                         help="Coefficient d'entropie")
-    parser.add_argument("--log_interval", type=int, default=20,
+    parser.add_argument("--log_interval", type=int, default=100,
                         help="Log toutes les N épisodes")
     args = parser.parse_args()
 
