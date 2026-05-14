@@ -17,16 +17,16 @@ spec:
                 - name: weights
                   value: "{{item.weights}}" # Correction : Ajout du paramètre manquant
             withItems:
-              - {weights: "run_1", overrides: "--lr=1e-4 --rollout=512 --ent_coef=0.01" }
-              - {weights: "run_2", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.01" }
-              - {weights: "run_3", overrides: "--lr=7e-4 --rollout=512 --ent_coef=0.01" }
-              - {weights: "run_4", overrides: "--lr=1e-3 --rollout=512 --ent_coef=0.01" }
-              - {weights: "run_5", overrides: "--lr=3e-4 --rollout=256 --ent_coef=0.01" }
-              - {weights: "run_6", overrides: "--lr=3e-4 --rollout=1024 --ent_coef=0.01" }
-              - {weights: "run_7", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.1" }
-              - {weights: "run_8", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.05" }
-              - {weights: "run_9", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.15" }
-              - {weights: "run_10", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.2" }
+              - {weights: "run_11", overrides: "--lr=1e-4 --rollout=512 --ent_coef=0.01" }
+              - {weights: "run_12", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.01" }
+              - {weights: "run_13", overrides: "--lr=7e-4 --rollout=512 --ent_coef=0.01" }
+              - {weights: "run_14", overrides: "--lr=1e-3 --rollout=512 --ent_coef=0.01" }
+              - {weights: "run_15", overrides: "--lr=3e-4 --rollout=256 --ent_coef=0.01" }
+              - {weights: "run_16", overrides: "--lr=3e-4 --rollout=1024 --ent_coef=0.01" }
+              - {weights: "run_17", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.1" }
+              - {weights: "run_18", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.05" }
+              - {weights: "run_19", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.15" }
+              - {weights: "run_20", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.2" }
 
     - name: trainer
       inputs:
@@ -46,7 +46,7 @@ spec:
           
           # Installation des dépendances si nécessaire et exécution
           # Note: uv run installera automatiquement l'environnement défini dans le verrou (lockfile)
-          uv run -m src.agents.agent_massive_training --train --device=cpu \
+          uv run -m src.agents.agent_massive_training_bis --train --device=cpu \
             {{inputs.parameters.overrides}} \
             --weights={{inputs.parameters.weights}}
         resources:
