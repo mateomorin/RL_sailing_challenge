@@ -798,8 +798,20 @@ class MyAgent(BaseAgent):
         self._net: NumpyActorCritic = None
 
         path = weights_path or self.DEFAULT_WEIGHTS_PATH
-        if os.path.exists(path):
-            self.load(path)
+        import os
+        try:
+            # Si le chemin est relatif, on le résout par rapport au dossier du script actuel
+            if not os.path.isabs(path):
+                base_dir = os.path.dirname(__file__)
+                path = os.path.join(base_dir, path)
+                
+            data = np.load(path, allow_pickle=True)
+            weights = {k: data[k] for k in data.files if not k.startswith('_')}
+            self._net = NumpyActorCritic(weights)
+            print(f"[MyAgent] Poids chargés avec succès depuis : {path}")
+        except Exception as e:
+            print(f"[MyAgent] Impossible de charger {path}: {e}")
+            self._net = None
 
     def act(self, observation: np.ndarray) -> int:
         """
