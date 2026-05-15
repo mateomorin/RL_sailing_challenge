@@ -8,7 +8,7 @@ setting, it will always find the goal without crashing into the island
 import numpy as np # type: ignore
 from agents.base_agent import BaseAgent
 
-class SuperNaiveAgent(BaseAgent):
+class MyAgent(BaseAgent):
     """
     A naive agent for the Sailing Challenge.
 

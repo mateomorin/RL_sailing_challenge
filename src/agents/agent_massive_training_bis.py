@@ -999,7 +999,7 @@ if __name__ == "__main__":
                         help="Learning rate")
     parser.add_argument("--ent_coef",   type=float, default=0.01,
                         help="Coefficient d'entropie")
-    parser.add_argument("--log_interval", type=int, default=100,
+    parser.add_argument("--log_interval", type=int, default=20,
                         help="Log toutes les N épisodes")
     args = parser.parse_args()
 

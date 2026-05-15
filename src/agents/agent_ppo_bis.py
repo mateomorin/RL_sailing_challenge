@@ -766,7 +766,7 @@ class MyAgent(BaseAgent):
         action = agent.act(observation)
     """
 
-    DEFAULT_WEIGHTS_PATH = "agent_ppo_bis_weights.npz"
+    DEFAULT_WEIGHTS_PATH = "ppo_from_scratch.npz"
 
     def __init__(self, weights_path: str = None):
         super().__init__()
@@ -774,7 +774,9 @@ class MyAgent(BaseAgent):
         self._net: NumpyActorCritic = None
 
         path = weights_path or self.DEFAULT_WEIGHTS_PATH
+        print(f"Trying to find path {path}...")
         if os.path.exists(path):
+            print("weights found: " + path)
             self.load(path)
 
     def act(self, observation: np.ndarray) -> int:

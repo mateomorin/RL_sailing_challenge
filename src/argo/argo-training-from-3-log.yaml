@@ -1,0 +1,67 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: rl-multi-trainer-
+spec:
+  entrypoint: main-dag
+  templates:
+    - name: main-dag
+      dag:
+        tasks:
+          - name: train
+            template: trainer
+            arguments:
+              parameters:
+                - name: overrides
+                  value: "{{item.overrides}}"
+                - name: weights
+                  value: "{{item.weights}}" # Correction : Ajout du paramètre manquant
+            withItems:
+              - {weights: "run_21.npz", overrides: "--lr=1e-4 --rollout=512 --ent_coef=0.01" }
+              - {weights: "run_22.npz", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.01" }
+              - {weights: "run_23.npz", overrides: "--lr=7e-4 --rollout=512 --ent_coef=0.01" }
+              - {weights: "run_24.npz", overrides: "--lr=1e-3 --rollout=512 --ent_coef=0.01" }
+              - {weights: "run_25.npz", overrides: "--lr=3e-4 --rollout=256 --ent_coef=0.01" }
+              - {weights: "run_26.npz", overrides: "--lr=3e-4 --rollout=1024 --ent_coef=0.01" }
+              - {weights: "run_27.npz", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.1" }
+              - {weights: "run_28.npz", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.05" }
+              - {weights: "run_29.npz", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.15" }
+              - {weights: "run_30.npz", overrides: "--lr=3e-4 --rollout=512 --ent_coef=0.2" }
+
+    - name: trainer
+      inputs:
+        parameters:
+          - name: overrides
+          - name: weights
+      script:
+        image: "inseefrlab/onyxia-vscode-python:py3.13.5"
+        imagePullPolicy: Always
+        command: ["/bin/bash"]
+        source: |
+          set -e
+          set -x
+          # Clone du dépôt
+          git clone -b main https://github.com/mateomorin/RL_sailing_challenge.git
+          cd RL_sailing_challenge
+          
+          # Installation des dépendances si nécessaire et exécution
+          uv sync
+          uv run -m src.agents.agent_massive_training_log --train --device=cpu \
+            {{inputs.parameters.overrides}} \
+            --weights={{inputs.parameters.weights}}
+        resources:
+          limits:
+            cpu: "1000m"
+            memory: "5Gi"
+          requests:
+            cpu: "400m"
+            memory: "2Gi" # Augmenté légèrement car 'uv' et le build d'env consomment de la RAM
+        env:
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom: { secretKeyRef: { name: rl-sailing, key: AWS_ACCESS_KEY_ID } }
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom: { secretKeyRef: { name: rl-sailing, key: AWS_SECRET_ACCESS_KEY } }
+          - name: AWS_SESSION_TOKEN
+            valueFrom: { secretKeyRef: { name: rl-sailing, key: AWS_SESSION_TOKEN } }
+          - name: UV_HTTP_TIMEOUT
+            value: "200"
