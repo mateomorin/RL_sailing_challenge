@@ -854,7 +854,7 @@ class MyAgent(BaseAgent):
         action = agent.act(observation)
     """
 
-    DEFAULT_WEIGHTS_PATH = "ppo_bc.npz"
+    DEFAULT_WEIGHTS_PATH = "bc_10_epoch_finetuned.npz"
 
     def __init__(self, weights_path: str = None):
         super().__init__()

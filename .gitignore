@@ -1,4 +1,6 @@
 # Exclude private content from the repository
+*.zip
+*.npz
 
 # Exclude all files and directories with names starting with "private"
 **/private*

@@ -3,6 +3,7 @@ import zlib
 import re
 import os
 import numpy as np
+import zipfile
 
 def create_standalone_submission(script_path, weights_path, output_path):
     print(f"Lecture des poids depuis {weights_path}...")
@@ -47,18 +48,25 @@ def create_standalone_submission(script_path, weights_path, output_path):
     modified_content = re.sub(pattern, embedded_load_code.strip(), content, flags=re.DOTALL)
     
     # Ajout de la constante à la fin du fichier
-    final_code = modified_content + f"\n\n# --- POIDS EMBARQUÉS ---\n"
+    final_code = modified_content + "\n\n# --- POIDS EMBARQUÉS ---\n"
     final_code += f"WEIGHTS_B64 = \"\"\"{b64_weights}\"\"\"\n"
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(final_code)
-        
+    # Write the submission zip with the .py file at the root
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("my_agent.py", final_code)
+
+    print(f"Created {output_path}")
+    print("Contents:")
+    with zipfile.ZipFile(output_path, "r") as zf:
+        for info in zf.infolist():
+            print(f"  {info.filename} ({info.file_size} bytes)")
+
     print(f"✓ Terminé ! Fichier créé : {output_path}")
 
 if __name__ == '__main__':
     # Modifiez ici si vos fichiers ont des noms différents
     create_standalone_submission(
-        script_path='src/agents/agent_ppo_bc.py', 
-        weights_path='ppo_bc.npz', 
-        output_path='submission_agent.py'
+        script_path='src/agents/ppo_bc_submission.py', 
+        weights_path='bc_10_epoch_finetuned.npz', 
+        output_path='bc_10_ft.zip'
     )
